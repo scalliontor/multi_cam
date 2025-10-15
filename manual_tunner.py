@@ -1,14 +1,14 @@
 # --- In manual_tuner.py ---
 import numpy as np
 
-EXTRINSICS_FILE = "extrinsics.npz"
+EXTRINSICS_FILE = "intrinsics_charuco_213622078112.npz"
 with np.load(EXTRINSICS_FILE) as data:
-    rvec_orig = data['rvec']
-    tvec_orig = data['tvec']
+    rvec_orig = data['mtx']
+    tvec_orig = data['dist']
 
 print("--- Original Values ---")
-print("rvec:\n", rvec_orig)
-print("tvec:\n", tvec_orig)
+print("a:\n", rvec_orig)
+print("b:\n", tvec_orig)
 
 # =================================================================
 # === MANUAL TUNING AREA ===
@@ -31,9 +31,9 @@ print("tvec:\n", tvec_orig)
 
 # =================================================================
 
-print("\n--- Using Tuned Values ---")
-print("rvec:\n", rvec_orig)
-print("tvec:\n", tvec_orig)
+# print("\n--- Using Tuned Values ---")
+# print("rvec:\n", rvec_orig)
+# print("tvec:\n", tvec_orig)
 # np.savez("extrinsics.npz", rvec=rvec, tvec=tvec)
 
 # ... the rest of your check2.py code continues from here ...

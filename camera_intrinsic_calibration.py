@@ -168,6 +168,7 @@ ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
     None,
     flags=flags)
 
+
 if not ret:
     print("❌ Calibration failed!")
     sys.exit(1)

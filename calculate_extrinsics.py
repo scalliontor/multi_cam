@@ -1,9 +1,10 @@
-# --- CÁC PHẦN IMPORT VÀ CẤU HÌNH BAN ĐẦU GIỮ NGUYÊN ---
 import pyrealsense2 as rs
 import numpy as np
 import cv2
 import os
+from scipy.spatial.transform import Rotation
 
+# --- 1. INITIAL CONFIGURATION ---
 POINT_CLOUD_CAMERA_SN = "832112070255" 
 RGB_CAMERA_SN = "213622078112"      
 
@@ -46,33 +47,29 @@ config_pc.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 pipeline_rgb = rs.pipeline()
 config_rgb = rs.config()
 config_rgb.enable_device(RGB_CAMERA_SN)
+# NOTE: This script does not require depth from the second camera, but the verification script does.
 config_rgb.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
 # Start streaming
 profile_pc = pipeline_pc.start(config_pc)
 pipeline_rgb.start(config_rgb)
 
-# Get depth sensor intrinsics for deprojection
 depth_intrinsics = profile_pc.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-
-# Alignment for depth to color
 align = rs.align(rs.stream.color)
 
-# ### THAY ĐỔI ###: Khởi tạo list để lưu trữ điểm từ nhiều lần chụp
-all_obj_points_3d = [] # Tập hợp các điểm 3D
-all_img_points_2d_rgb = [] # Tập hợp các điểm 2D tương ứng
+# Lists to store corresponding 3D point pairs from multiple captures
+all_points_3d_pc = []
+all_points_3d_rgb = []
 
 print("Position the board to be visible in both cameras.")
-print("Press 'c' to capture a view. Aim for 5-10 views.")
+print("Press 'c' to capture a view. Aim for 5-10 views from different angles.")
 print("Press 'q' to quit and calculate extrinsics.")
 
 try:
     while True:
-        # Get frames from both cameras
         frames_pc = pipeline_pc.wait_for_frames()
         frames_rgb = pipeline_rgb.wait_for_frames()
 
-        # Align depth frame to color frame for the point cloud camera
         aligned_frames = align.process(frames_pc)
         depth_frame = aligned_frames.get_depth_frame()
         color_frame_pc = aligned_frames.get_color_frame()
@@ -81,17 +78,14 @@ try:
         if not depth_frame or not color_frame_pc or not color_frame_rgb:
             continue
 
-        # Convert images to numpy arrays
         img_pc = np.asanyarray(color_frame_pc.get_data())
         img_rgb = np.asanyarray(color_frame_rgb.get_data())
         gray_pc = cv2.cvtColor(img_pc, cv2.COLOR_BGR2GRAY)
         gray_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
 
-        # Detect board in both images
         charuco_corners_pc, charuco_ids_pc, _, _ = detector.detectBoard(gray_pc)
         charuco_corners_rgb, charuco_ids_rgb, _, _ = detector.detectBoard(gray_rgb)
 
-        # Draw detections for visualization
         if charuco_ids_pc is not None: cv2.aruco.drawDetectedCornersCharuco(img_pc, charuco_corners_pc, charuco_ids_pc)
         if charuco_ids_rgb is not None: cv2.aruco.drawDetectedCornersCharuco(img_rgb, charuco_corners_rgb, charuco_ids_rgb)
 
@@ -101,69 +95,121 @@ try:
         key = cv2.waitKey(1)
         if key == ord('q'): break
         
-        # --- ### THAY ĐỔI ###: CALIBRATION LOGIC - CHỈ THU THẬP ĐIỂM ---
+        # --- 3D-to-3D CALIBRATION LOGIC ---
         if key == ord('c') and charuco_ids_pc is not None and charuco_ids_rgb is not None:
-            print(f"Capturing frame #{len(all_obj_points_3d) + 1}...")
-
-            # Match corners between the two views
             common_ids = np.intersect1d(charuco_ids_pc.flatten(), charuco_ids_rgb.flatten())
             if len(common_ids) < 4:
                 print("Not enough common corners found. Reposition the board.")
                 continue
+            
+            # --- Estimate 3D points for the RGB Camera (Method: SolvePnP) ---
+            obj_points_ideal = []
+            img_points_for_pnp = []
+            for id_val in common_ids:
+                idx_rgb = np.where(charuco_ids_rgb.flatten() == id_val)[0][0]
+                # The ID itself is the index into the ideal board definition
+                obj_points_ideal.append(board.getChessboardCorners()[id_val])
+                img_points_for_pnp.append(charuco_corners_rgb[idx_rgb])
 
-            # Get the 3D points from the Point Cloud camera
-            obj_points_3d_capture = []
-            img_points_2d_rgb_capture = []
+            obj_points_ideal = np.array(obj_points_ideal, dtype=np.float32)
+            img_points_for_pnp = np.array(img_points_for_pnp, dtype=np.float32)
+            
+            success_pnp, rvec_board_to_rgb, tvec_board_to_rgb = cv2.solvePnP(
+                obj_points_ideal, img_points_for_pnp, rgb_cam_mtx, rgb_cam_dist
+            )
+            
+            if not success_pnp:
+                print("PnP failed for RGB camera on this view. Try another angle.")
+                continue
+                
+            R_board_to_rgb, _ = cv2.Rodrigues(rvec_board_to_rgb)
+
+            # --- Now collect corresponding 3D point pairs ---
+            points_3d_pc_capture = []
+            points_3d_rgb_capture = []
 
             for id_val in common_ids:
                 idx_pc = np.where(charuco_ids_pc.flatten() == id_val)[0][0]
-                idx_rgb = np.where(charuco_ids_rgb.flatten() == id_val)[0][0]
                 
-                corner_pc_2d = charuco_corners_pc[idx_pc][0]
-                u, v = int(corner_pc_2d[0]), int(corner_pc_2d[1])
+                # Get measured 3D point from the PC camera using its depth sensor
+                u_pc, v_pc = map(int, charuco_corners_pc[idx_pc][0])
+                depth = depth_frame.get_distance(u_pc, v_pc)
 
-                depth = depth_frame.get_distance(u, v)
-                if depth > 0:
-                    point_3d = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [u, v], depth)
-                    obj_points_3d_capture.append(point_3d)
-                    img_points_2d_rgb_capture.append(charuco_corners_rgb[idx_rgb])
+                if depth > 0.1: # If depth is valid...
+                    # Point A: Measured 3D point from PC camera
+                    point_3d_pc = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [u_pc, v_pc], depth)
+                    
+                    # Point B: Estimated 3D point from RGB camera
+                    ideal_corner = board.getChessboardCorners()[id_val].flatten()
+                    point_3d_rgb = R_board_to_rgb @ ideal_corner + tvec_board_to_rgb.flatten()
+                    
+                    points_3d_pc_capture.append(point_3d_pc)
+                    points_3d_rgb_capture.append(point_3d_rgb)
 
-            if len(obj_points_3d_capture) < 4:
-                print("Could not get enough valid 3D points. Check for glare or distance.")
+            if len(points_3d_pc_capture) < 4:
+                print("Could not get enough valid 3D point pairs. Check for glare or distance.")
                 continue
             
-            # Thêm các điểm của lần chụp này vào danh sách tổng
-            all_obj_points_3d.extend(obj_points_3d_capture)
-            all_img_points_2d_rgb.extend(img_points_2d_rgb_capture)
-            print(f"Capture successful. Total captures: {len(all_obj_points_3d)}")
+            all_points_3d_pc.extend(points_3d_pc_capture)
+            all_points_3d_rgb.extend(points_3d_rgb_capture)
+            print(f"Capture successful. Total 3D point pairs: {len(all_points_3d_pc)}")
 
 finally:
     pipeline_pc.stop()
     pipeline_rgb.stop()
     cv2.destroyAllWindows()
 
-# --- ### THAY ĐỔI ###: TÍNH TOÁN EXTRINSICS SAU KHI THU THẬP XONG ---
-if len(all_obj_points_3d) > 0 and len(all_img_points_2d_rgb) > 0:
-    print("\nCalculating extrinsics from all captured views...")
+# --- 3D-to-3D TRANSFORMATION CALCULATION ---
+if len(all_points_3d_pc) >= 3:
+    print(f"\nCalculating 3D-to-3D transformation from {len(all_points_3d_pc)} point pairs...")
     
-    # Chuyển đổi list thành numpy arrays
-    obj_points_3d = np.array(all_obj_points_3d, dtype=np.float32) * 1000 # convert meters to mm
-    img_points_2d_rgb = np.array(all_img_points_2d_rgb, dtype=np.float32)
+    # Convert lists to numpy arrays and ensure units are consistent (meters)
+    points_pc_m = np.array(all_points_3d_pc, dtype=np.float32)
+    # The estimated points were in mm, so convert to meters
+    points_rgb_m = np.array(all_points_3d_rgb, dtype=np.float32) * 0.001
 
-    # Sử dụng solvePnP để tìm rotation và translation
-    success, rvec, tvec = cv2.solvePnP(
-        obj_points_3d, img_points_2d_rgb, rgb_cam_mtx, rgb_cam_dist
-    )
-
-    if success:
-        print("\nExtrinsic calibration successful!")
-        print("Rotation Vector (rvec):\n", rvec)
-        print("Translation Vector (tvec) in mm:\n", tvec)
+    # Using Kabsch algorithm (SVD method) for rigid transformation
+    # This is often more stable than estimateAffine3D for this specific problem
+    try:
+        # Center the point clouds
+        centroid_pc = np.mean(points_pc_m, axis=0)
+        centroid_rgb = np.mean(points_rgb_m, axis=0)
         
-        # Lưu kết quả
-        np.savez("extrinsics.npz", rvec=rvec, tvec=tvec)
-        print("Extrinsics saved to extrinsics.npz")
-    else:
-        print("solvePnP failed. Try to capture more varied views.")
+        centered_pc = points_pc_m - centroid_pc
+        centered_rgb = points_rgb_m - centroid_rgb
+        
+        # SVD for rotation estimation
+        H = centered_pc.T @ centered_rgb
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        
+        # Ensure proper rotation (det(R) = 1)
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        
+        # Calculate translation
+        t = centroid_pc - R @ centroid_rgb
+        
+        # Convert results to OpenCV format and desired units (mm for tvec)
+        rvec, _ = cv2.Rodrigues(R)
+        tvec = t.reshape(3, 1) * 1000 # Reshape and convert to mm
+        R_final = R
+        tvec_final = tvec
+
+        print("\n3D-to-3D calibration successful (SVD method)!")
+        print("Rotation Vector (rvec):\n", rvec)
+        print("Translation Vector (tvec) in mm:\n", tvec_final)
+        
+        # Save results
+        np.savez("extrinsics.npz", 
+                rvec=rvec, 
+                tvec=tvec_final,
+                R=R_final)
+        print("3D-to-3D extrinsics saved to extrinsics.npz")
+        
+    except Exception as e:
+        print(f"3D-to-3D transformation estimation failed: {e}")
+            
 else:
-    print("No valid views were captured. Extrinsics not calculated.")
+    print(f"Not enough valid 3D point pairs captured ({len(all_points_3d_pc)} found). Extrinsics not calculated.")
