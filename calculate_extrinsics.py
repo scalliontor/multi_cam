@@ -1,21 +1,33 @@
+#!/usr/bin/env python3
+"""
+RealSense Dual-Camera Extrinsic Calibration
+===========================================
+
+This script performs 3D-to-3D extrinsic calibration between two RealSense cameras
+using ChArUco board detection and the Kabsch algorithm for rigid body transformation.
+
+Author: Multi-Camera Calibration System
+Date: 2025
+"""
+
 import pyrealsense2 as rs
 import numpy as np
 import cv2
 import os
 
-# --- 1. INITIAL CONFIGURATION ---
-PC_CAMERA_SN = "832112070255"
-RGB_CAMERA_SN = "213622078112"      
-
+# --- CONFIGURATION ---
+PC_CAMERA_SN = "832112070255"  # Primary camera serial number
+RGB_CAMERA_SN = "213622078112"  # Secondary camera serial number
 CONFIG_FILE = "charuco_board_config.npz"
-INTRINSICS_PC_FILE = f"intrinsics_charuco_{PC_CAMERA_SN}.npz"
-INTRINSICS_RGB_FILE = f"intrinsics_charuco_{RGB_CAMERA_SN}.npz"
+OUTPUT_FILE = "extrinsics.npz"
 
-for f in [CONFIG_FILE, INTRINSICS_PC_FILE, INTRINSICS_RGB_FILE]:
-    if not os.path.exists(f):
-        print(f"Error: Missing required file: '{f}'")
-        exit()
+# Validate required files
+if not os.path.exists(CONFIG_FILE):
+    print(f"❌ Error: Missing required file: '{CONFIG_FILE}'")
+    print("Please generate ChArUco board configuration first.")
+    exit(1)
 
+# Load ChArUco board configuration
 config_data = np.load(CONFIG_FILE)
 ARUCO_DICT_ID = int(config_data['aruco_dict_id'])
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
@@ -27,37 +39,70 @@ board = cv2.aruco.CharucoBoard(
 )
 detector = cv2.aruco.CharucoDetector(board)
 
-# --- 2. REALSENSE PIPELINES SETUP (BOTH WITH DEPTH) ---
-pipeline_pc = rs.pipeline()
-config_pc = rs.config()
-config_pc.enable_device(PC_CAMERA_SN)
-config_pc.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-config_pc.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+print("🎯 RealSense Dual-Camera Extrinsic Calibration")
+print("=" * 50)
+print(f"Primary Camera: {PC_CAMERA_SN}")
+print(f"Secondary Camera: {RGB_CAMERA_SN}")
+print(f"ChArUco Board: {config_data['squares_x']}x{config_data['squares_y']}")
 
-pipeline_rgb = rs.pipeline()
-config_rgb = rs.config()
-config_rgb.enable_device(RGB_CAMERA_SN)
-# ### THIS IS THE KEY CHANGE: ENABLE DEPTH ON THE SECOND CAMERA ###
-config_rgb.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-config_rgb.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+# --- REALSENSE SETUP ---
+def setup_cameras():
+    """Initialize and configure RealSense cameras."""
+    print("\n🔧 Initializing cameras...")
+    
+    # Setup primary camera
+    pipeline_pc = rs.pipeline()
+    config_pc = rs.config()
+    config_pc.enable_device(PC_CAMERA_SN)
+    config_pc.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config_pc.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    
+    # Setup secondary camera
+    pipeline_rgb = rs.pipeline()
+    config_rgb = rs.config()
+    config_rgb.enable_device(RGB_CAMERA_SN)
+    config_rgb.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config_rgb.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    
+    # Start streaming
+    profile_pc = pipeline_pc.start(config_pc)
+    profile_rgb = pipeline_rgb.start(config_rgb)
+    
+    # Get intrinsics
+    color_intrinsics_pc = profile_pc.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    color_intrinsics_rgb = profile_rgb.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    
+    # Setup alignment
+    align_pc = rs.align(rs.stream.color)
+    align_rgb = rs.align(rs.stream.color)
+    
+    return (pipeline_pc, pipeline_rgb, color_intrinsics_pc, color_intrinsics_rgb, 
+            align_pc, align_rgb)
 
-# Start streaming and get intrinsics for BOTH cameras
-profile_pc = pipeline_pc.start(config_pc)
-intrinsics_pc = profile_pc.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-align_pc = rs.align(rs.stream.color)
+# Initialize cameras
+(pipeline_pc, pipeline_rgb, color_intrinsics_pc, color_intrinsics_rgb, 
+ align_pc, align_rgb) = setup_cameras()
 
-profile_rgb = pipeline_rgb.start(config_rgb)
-intrinsics_rgb = profile_rgb.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-align_rgb = rs.align(rs.stream.color)
+print("✅ Cameras initialized successfully")
+print(f"Primary Camera Color - fx:{color_intrinsics_pc.fx:.2f}, fy:{color_intrinsics_pc.fy:.2f}")
+print(f"Secondary Camera Color - fx:{color_intrinsics_rgb.fx:.2f}, fy:{color_intrinsics_rgb.fy:.2f}")
+print("📌 Using COLOR intrinsics for consistent 3D coordinate system")
 
 
-# Lists to store corresponding, *measured* 3D point pairs from multiple captures
-all_points_3d_pc = []
-all_points_3d_rgb = []
-
-print("Position the board to be visible in both cameras.")
-print("Press 'c' to capture a view. Aim for 5-10 views from different angles.")
-print("Press 'q' to quit and calculate extrinsics.")
+# --- DATA COLLECTION ---
+def collect_calibration_data():
+    """Collect 3D point pairs from both cameras for calibration."""
+    all_points_3d_pc = []
+    all_points_3d_rgb = []
+    
+    print("\n📸 DATA COLLECTION PHASE")
+    print("=" * 30)
+    print("Instructions:")
+    print("• Position ChArUco board visible to both cameras")
+    print("• Press 'c' to capture a view (aim for 8-15 different positions)")
+    print("• Move board to different angles and distances")
+    print("• Press 'q' when done collecting data")
+    print("\nStarting live preview...")
 
 try:
     while True:
@@ -93,7 +138,7 @@ try:
         key = cv2.waitKey(1)
         if key == ord('q'): break
         
-        # --- DIRECT 3D-to-3D CALIBRATION LOGIC ---
+        # --- 3D-to-3D CALIBRATION LOGIC (3D from PC camera -> 3D from RGB camera) ---
         if key == ord('c') and ids_pc is not None and ids_rgb is not None:
             common_ids = np.intersect1d(ids_pc.flatten(), ids_rgb.flatten())
             if len(common_ids) < 4:
@@ -108,84 +153,147 @@ try:
                 idx_rgb = np.where(ids_rgb.flatten() == id_val)[0][0]
                 
                 # Get 3D point from PC camera
-                u_pc, v_pc = map(int, corners_pc[idx_pc][0])
+                corner_pc = corners_pc[idx_pc][0]
+                u_pc, v_pc = int(corner_pc[0]), int(corner_pc[1])
                 depth_pc = depth_frame_pc.get_distance(u_pc, v_pc)
                 
                 # Get 3D point from RGB camera
-                u_rgb, v_rgb = map(int, corners_rgb[idx_rgb][0])
+                corner_rgb = corners_rgb[idx_rgb][0]
+                u_rgb, v_rgb = int(corner_rgb[0]), int(corner_rgb[1])
                 depth_rgb = depth_frame_rgb.get_distance(u_rgb, v_rgb)
 
-                # Only use the point pair if BOTH cameras have a valid depth reading
+                # Only use points where BOTH cameras have valid depth
                 if depth_pc > 0.1 and depth_rgb > 0.1:
-                    point_pc = rs.rs2_deproject_pixel_to_point(intrinsics_pc, [u_pc, v_pc], depth_pc)
-                    points_3d_pc_capture.append(point_pc)
+                    # CRITICAL FIX: Since we're using color-aligned frames, we need to use
+                    # the color intrinsics to get correct 3D points in the aligned coordinate system
+                    point_3d_pc = rs.rs2_deproject_pixel_to_point(color_intrinsics_pc, [u_pc, v_pc], depth_pc)
+                    point_3d_rgb = rs.rs2_deproject_pixel_to_point(color_intrinsics_rgb, [u_rgb, v_rgb], depth_rgb)
                     
-                    point_rgb = rs.rs2_deproject_pixel_to_point(intrinsics_rgb, [u_rgb, v_rgb], depth_rgb)
-                    # print(point_rgb)
-                    points_3d_rgb_capture.append(point_rgb)
+                    points_3d_pc_capture.append(point_3d_pc)
+                    points_3d_rgb_capture.append(point_3d_rgb)
             
-            if len(points_3d_pc_capture) < 4:
-                print("Could not get enough valid 3D point pairs. Check for glare or distance.")
+            if len(points_3d_pc_capture) < 3:
+                print("Could not get enough valid 3D-3D point pairs. Check for glare or distance.")
                 continue
 
             all_points_3d_pc.extend(points_3d_pc_capture)
             all_points_3d_rgb.extend(points_3d_rgb_capture)
-            print(f"Capture successful. Total 3D point pairs: {len(all_points_3d_pc)}")
+            print(f"Capture successful. Total 3D-3D pairs: {len(all_points_3d_pc)}")
 
 finally:
     pipeline_pc.stop()
     pipeline_rgb.stop()
     cv2.destroyAllWindows()
 
-# --- 3D-to-3D TRANSFORMATION CALCULATION (RIGID ALIGNMENT) ---
-if len(all_points_3d_pc) >= 3:
-    print(f"\nCalculating 3D-to-3D transformation from {len(all_points_3d_pc)} point pairs...")
+# Helper functions for converting RealSense intrinsics to OpenCV format
+def rs_intrinsics_to_cv_matrix(intrinsics):
+    return np.array([[intrinsics.fx, 0, intrinsics.ppx],
+                     [0, intrinsics.fy, intrinsics.ppy],
+                     [0, 0, 1]], dtype=np.float32)
+
+def rs_intrinsics_to_cv_dist(intrinsics):
+    return np.array([intrinsics.coeffs[0], intrinsics.coeffs[1], 
+                     intrinsics.coeffs[2], intrinsics.coeffs[3], 
+                     intrinsics.coeffs[4]], dtype=np.float32)
+
+# Kabsch algorithm for 3D-to-3D rigid body transformation
+def kabsch_algorithm(P, Q):
+    """
+    Calculate the optimal rotation matrix and translation vector to align point clouds P and Q.
+    P: source points (Nx3)
+    Q: target points (Nx3)  
+    Returns: R (3x3 rotation matrix), t (3x1 translation vector)
+    """
+    # Center the point clouds
+    centroid_P = np.mean(P, axis=0)
+    centroid_Q = np.mean(Q, axis=0)
     
-    # Convert lists to numpy arrays (points are in meters)
-    points_pc = np.array(all_points_3d_pc, dtype=np.float64)
-    points_rgb = np.array(all_points_3d_rgb, dtype=np.float64)
-
-    # Use the Kabsch algorithm (SVD method) to find the optimal rigid transformation
-    try:
-        # 1. Find the centroids of both point sets
-        centroid_pc = np.mean(points_pc, axis=0)
-        centroid_rgb = np.mean(points_rgb, axis=0)
-        
-        # 2. Center the point clouds
-        centered_pc = points_pc - centroid_pc
-        centered_rgb = points_rgb - centroid_rgb
-        
-        # 3. Compute the covariance matrix H
-        H = centered_pc.T @ centered_rgb
-        
-        # 4. Use SVD to find the rotation
-        U, S, Vt = np.linalg.svd(H)
+    P_centered = P - centroid_P
+    Q_centered = Q - centroid_Q
+    
+    # Compute the cross-covariance matrix
+    H = P_centered.T @ Q_centered
+    
+    # Singular Value Decomposition
+    U, S, Vt = np.linalg.svd(H)
+    
+    # Compute rotation matrix
+    R = Vt.T @ U.T
+    
+    # Ensure proper rotation (det(R) = 1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
         R = Vt.T @ U.T
-        
-        # 5. Handle special reflection case
-        if np.linalg.det(R) < 0:
-           Vt[-1,:] *= -1
-           R = Vt.T @ U.T
-        
-        # 6. Compute the translation
-        t = centroid_rgb - R @ centroid_pc
-        
-        # Format results for saving
-        rvec, _ = cv2.Rodrigues(R)
-        tvec_mm = t.reshape(3, 1) * 1000 # Reshape and convert to millimeters
+    
+    # Compute translation
+    t = centroid_Q - R @ centroid_P
+    
+    return R, t
 
-        print("\nDirect 3D-to-3D calibration successful!")
+# --- 3D-to-3D CALIBRATION (Kabsch Algorithm) ---
+if len(all_points_3d_pc) >= 3:
+    print(f"\nCalculating extrinsics using 3D-to-3D calibration from {len(all_points_3d_pc)} point pairs...")
+    
+    # Convert lists to numpy arrays
+    points_3d_pc = np.array(all_points_3d_pc, dtype=np.float32)
+    points_3d_rgb = np.array(all_points_3d_rgb, dtype=np.float32)
+    
+    print(f"PC 3D points shape: {points_3d_pc.shape}")
+    print(f"RGB 3D points shape: {points_3d_rgb.shape}")
+
+    try:
+        # Apply Kabsch algorithm to find transformation from PC to RGB coordinate system
+        R, t = kabsch_algorithm(points_3d_pc, points_3d_rgb)
+
+        print("\n3D-to-3D calibration successful!")
+        print("Rotation Matrix (R):\n", R)
+        print("Translation Vector (t) in meters:\n", t)
+        
+        # Convert to OpenCV format - KEEP CONSISTENT UNITS
+        rvec, _ = cv2.Rodrigues(R)
+        # Store both formats for compatibility
+        tvec_mm = t.reshape(-1, 1) * 1000  # For OpenCV functions that expect mm
+        tvec_m = t.reshape(-1, 1)          # For RealSense functions that work in meters
+        
         print("Rotation Vector (rvec):\n", rvec)
         print("Translation Vector (tvec) in mm:\n", tvec_mm)
+        print("Translation Vector (t) in meters:\n", tvec_m)
         
+        # Verify the calibration by transforming PC points and comparing with RGB points
+        points_3d_transformed = (R @ points_3d_pc.T + t.reshape(-1, 1)).T
+        
+        # Calculate 3D transformation error
+        errors_3d = np.linalg.norm(points_3d_rgb - points_3d_transformed, axis=1)
+        mean_error_3d = np.mean(errors_3d) * 1000  # Convert to mm
+        max_error_3d = np.max(errors_3d) * 1000
+        
+        print(f"\n3D Transformation Error Analysis:")
+        print(f"Mean error: {mean_error_3d:.2f} mm")
+        print(f"Max error: {max_error_3d:.2f} mm")
+        print(f"RMS error: {np.sqrt(np.mean(errors_3d**2)) * 1000:.2f} mm")
+        
+        if mean_error_3d < 5.0:
+            print("✅ EXCELLENT calibration quality!")
+        elif mean_error_3d < 15.0:
+            print("✅ GOOD calibration quality")
+        elif mean_error_3d < 30.0:
+            print("✅ ACCEPTABLE calibration quality")
+        else:
+            print("⚠️ Consider recalibrating - high transformation error")
+        
+        # Save results with proper unit documentation
         np.savez("extrinsics.npz", 
                 rvec=rvec, 
-                tvec=tvec_mm,
-                R=R)
-        print("Direct 3D extrinsics saved to extrinsics.npz")
+                tvec=tvec_mm,      # Translation in millimeters (OpenCV standard)
+                R=R,
+                t=tvec_m.flatten(), # Translation in meters (RealSense standard)
+                mean_3d_error=mean_error_3d,
+                max_3d_error=max_error_3d,
+                calibration_method="3D_to_3D_Kabsch")
+        print("3D-to-3D extrinsics saved to extrinsics.npz")
         
     except Exception as e:
-        print(f"3D-to-3D transformation estimation failed: {e}")
+        print(f"3D-to-3D calibration failed: {e}")
             
 else:
-    print(f"Not enough valid 3D point pairs captured ({len(all_points_3d_pc)} found). Extrinsics not calculated.")
+    print(f"Not enough valid 3D-3D point pairs captured ({len(all_points_3d_pc)} found, need at least 3). Extrinsics not calculated.")
